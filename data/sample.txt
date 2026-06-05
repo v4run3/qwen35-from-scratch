@@ -1,0 +1,5 @@
+To build language models from scratch, you start with tokenization, then embeddings,
+then stacked transformer blocks with attention and feed-forward layers.
+Hybrid models mix linear attention with full softmax attention for long context.
+Mixture-of-experts routes each token to a small subset of expert networks.
+Training uses next-token prediction with cross-entropy loss on sliding windows.
