@@ -26,6 +26,8 @@ class Qwen35Config:
     rope_theta: float = 1_000_000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = True
+    gradient_checkpointing: bool = False
+    mixed_precision: str = "none"
 
     # Hybrid attention (GDN + full softmax every gdn_interval layers)
     use_hybrid_attention: bool = True

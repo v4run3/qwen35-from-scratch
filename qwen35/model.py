@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from qwen35.cache import KVCache
 from qwen35.config import Qwen35Config
@@ -43,14 +44,28 @@ class TextModel(nn.Module):
             position_offset = kv_cache.seq_len() if kv_cache is not None else 0
 
         for layer in self.layers:
-            if isinstance(layer, DecoderLayer):
+            if self.config.gradient_checkpointing and self.training and kv_cache is None:
+                x = checkpoint(
+                    lambda hidden, block=layer: block(
+                        hidden,
+                        kv_cache=None,
+                        position_offset=0,
+                    ),
+                    x,
+                    use_reentrant=False,
+                )
+            elif isinstance(layer, DecoderLayer):
                 x = layer(
                     x,
                     kv_cache=kv_cache,
                     position_offset=position_offset,
                 )
             else:
-                x = layer(x)
+                x = layer(
+                    x,
+                    kv_cache=kv_cache,
+                    position_offset=position_offset,
+                )
         return self.norm(x)
 
 
