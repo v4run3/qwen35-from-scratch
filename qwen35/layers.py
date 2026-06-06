@@ -47,8 +47,13 @@ class GDNLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = build_mlp(config)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        x = x + self.linear_attn(self.input_layernorm(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        x = x + self.linear_attn(self.input_layernorm(x), kv_cache=kv_cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 

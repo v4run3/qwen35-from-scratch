@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from qwen35.cache import KVCache
 from qwen35.config import Qwen35Config
 from qwen35.norms import RMSNormGated
 from qwen35.utils import l2norm
@@ -165,12 +166,39 @@ class ShortConvolution(nn.Module):
             padding=kernel_size - 1,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # x: [B, T, C]
-        x = x.transpose(1, 2)
-        y = self.conv(x)
-        y = y[..., : x.shape[-1]]
-        return F.silu(y.transpose(1, 2))
+        x_t = x.transpose(1, 2)
+        if conv_state is None:
+            y = self.conv(x_t)
+            y = y[..., : x_t.shape[-1]]
+            full = x_t
+        else:
+            full = torch.cat((conv_state.to(x_t), x_t), dim=-1)
+            if full.shape[-1] < self.kernel_size:
+                full = F.pad(full, (self.kernel_size - full.shape[-1], 0))
+            y = F.conv1d(full, self.conv.weight, groups=self.conv.groups)
+
+        y = F.silu(y.transpose(1, 2))
+        if not return_state:
+            return y
+
+        if self.kernel_size == 1:
+            new_state = x_t[..., :0]
+        else:
+            state_source = full
+            if state_source.shape[-1] < self.kernel_size - 1:
+                state_source = F.pad(
+                    state_source,
+                    (self.kernel_size - 1 - state_source.shape[-1], 0),
+                )
+            new_state = state_source[..., -(self.kernel_size - 1) :].detach()
+        return y, new_state
 
 
 class GatedDeltaNet(nn.Module):
@@ -215,12 +243,33 @@ class GatedDeltaNet(nn.Module):
 
         self.o_norm = RMSNormGated(self.head_v_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _conv_forward(
+        self,
+        conv: ShortConvolution,
+        x: torch.Tensor,
+        kv_cache: KVCache | None,
+        name: str,
+    ) -> torch.Tensor:
+        if kv_cache is None:
+            out = conv(x)
+            assert isinstance(out, torch.Tensor)
+            return out
+
+        conv_state = kv_cache.get_gdn_conv_state(self.layer_idx, name)
+        out, new_state = conv(x, conv_state=conv_state, return_state=True)
+        kv_cache.update_gdn_conv_state(self.layer_idx, name, new_state)
+        return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: KVCache | None = None,
+    ) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
 
-        q = self.q_conv(self.q_proj(x))
-        k = self.k_conv(self.k_proj(x))
-        v = self.v_conv(self.v_proj(x))
+        q = self._conv_forward(self.q_conv, self.q_proj(x), kv_cache, "q")
+        k = self._conv_forward(self.k_conv, self.k_proj(x), kv_cache, "k")
+        v = self._conv_forward(self.v_conv, self.v_proj(x), kv_cache, "v")
 
         q = q.view(batch_size, seq_len, -1, self.head_k_dim)
         k = k.view(batch_size, seq_len, -1, self.head_k_dim)
@@ -239,20 +288,34 @@ class GatedDeltaNet(nn.Module):
             self.a_proj(x).float() + self.dt_bias
         )
 
+        initial_state = kv_cache.get_gdn_state(self.layer_idx) if kv_cache is not None else None
+        output_final_state = kv_cache is not None
+
         if seq_len == 1:
-            output, _ = torch_recurrent_gated_delta_rule(
-                q, k, v, g=g, beta=beta, use_qk_l2norm_in_kernel=True
+            output, final_state = torch_recurrent_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
-            output, _ = torch_chunk_gated_delta_rule(
+            output, final_state = torch_chunk_gated_delta_rule(
                 q,
                 k,
                 v,
                 g=g,
                 beta=beta,
                 chunk_size=self.chunk_size,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=True,
             )
+        if kv_cache is not None:
+            kv_cache.update_gdn_state(self.layer_idx, final_state)
 
         gate = self.g_proj(x)
         output = output.reshape(-1, self.head_v_dim)

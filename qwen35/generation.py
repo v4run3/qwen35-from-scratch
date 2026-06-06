@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 
 from qwen35.cache import KVCache
-from qwen35.layers import DecoderLayer
 from qwen35.model import Qwen35ForCausalLM
 
 
@@ -20,14 +19,7 @@ def generate(
     model.eval()
     config = model.config
 
-    has_full_attn = any(
-        isinstance(layer, DecoderLayer) for layer in model.model.layers
-    )
-    kv_cache = (
-        KVCache.empty(config.num_hidden_layers)
-        if use_kv_cache and has_full_attn
-        else None
-    )
+    kv_cache = KVCache.empty(config.num_hidden_layers) if use_kv_cache else None
 
     out = model(input_ids, kv_cache=kv_cache, position_offset=0)
 
