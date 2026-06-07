@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from qwen35.cache import KVCache
 from qwen35.config import Qwen35Config
+from qwen35.kernels import attention_forward
 from qwen35.rope import RotaryEmbedding, apply_rotary_pos_emb
 from qwen35.utils import repeat_kv
 
@@ -66,23 +67,7 @@ class SelfAttention(nn.Module):
         k = repeat_kv(k, self.num_key_value_groups)
         v = repeat_kv(v, self.num_key_value_groups)
 
-        attn_scores = q @ k.transpose(-2, -1)
-        attn_scores = attn_scores / (self.head_dim**0.5)
-
-        if kv_cache is None:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-                diagonal=1,
-            )
-            attn_scores = attn_scores.masked_fill(
-                causal_mask, torch.finfo(x.dtype).min
-            )
-        else:
-            # Query positions attend to all cached keys (causal by construction)
-            pass
-
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        context = attn_weights @ v
+        context = attention_forward(q, k, v, causal=True, use_flash=True)
         context = context.transpose(1, 2).contiguous().view(
             batch_size, seq_len, hidden_size
         )

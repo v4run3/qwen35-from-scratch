@@ -13,6 +13,15 @@ from qwen35.config import Qwen35Config
 from qwen35.norms import RMSNormGated
 from qwen35.utils import l2norm
 
+try:
+    from qwen35.kernels import fla_chunk_gated_delta_rule as _fla_chunk_gdn
+    from qwen35.kernels import fla_fused_recurrent_gated_delta_rule as _fla_fused_gdn
+    _HAS_FLA_GDN = True
+except ImportError:
+    _HAS_FLA_GDN = False
+    _fla_chunk_gdn = None
+    _fla_fused_gdn = None
+
 
 def torch_chunk_gated_delta_rule(
     query: torch.Tensor,
@@ -292,28 +301,57 @@ class GatedDeltaNet(nn.Module):
         output_final_state = kv_cache is not None
 
         if seq_len == 1:
-            output, final_state = torch_recurrent_gated_delta_rule(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if _HAS_FLA_GDN and _fla_fused_gdn is not None and q.is_cuda:
+                output = _fla_fused_gdn(
+                    q=q.contiguous(),
+                    k=k.contiguous(),
+                    v=v.contiguous(),
+                    g=g.contiguous(),
+                    beta=beta.contiguous(),
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                )
+                final_state = output[-1] if output_final_state and isinstance(output, tuple) else None
+                if isinstance(output, tuple):
+                    output = output[0]
+            else:
+                output, final_state = torch_recurrent_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
-            output, final_state = torch_chunk_gated_delta_rule(
-                q,
-                k,
-                v,
-                g=g,
-                beta=beta,
-                chunk_size=self.chunk_size,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if _HAS_FLA_GDN and _fla_chunk_gdn is not None and q.is_cuda:
+                output = _fla_chunk_gdn(
+                    q=q.contiguous(),
+                    k=k.contiguous(),
+                    v=v.contiguous(),
+                    g=g.contiguous(),
+                    beta=beta.contiguous(),
+                    chunk_size=self.chunk_size,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                )
+                final_state = output[-1] if output_final_state and isinstance(output, tuple) else None
+                if isinstance(output, tuple):
+                    output = output[0]
+            else:
+                output, final_state = torch_chunk_gated_delta_rule(
+                    q,
+                    k,
+                    v,
+                    g=g,
+                    beta=beta,
+                    chunk_size=self.chunk_size,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=True,
+                )
         if kv_cache is not None:
             kv_cache.update_gdn_state(self.layer_idx, final_state)
 
