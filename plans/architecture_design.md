@@ -69,4 +69,4 @@ graph TD
 3. **Short Convolutions**: Keep a small kernel (k=4) to give the linear attention a local "look-back" window before the global linear accumulation.
 
 ---
-**Would you like me to refine any specific part of this design, such as the MoE routing logic or the GDN chunking parameters?**
+

@@ -162,4 +162,3 @@ It is designed to be:
 - efficient enough for longer contexts
 - extensible for MoE and future kernel improvements
 
-If you want, I can also add a second markdown page showing the exact file-level flow for training, inference, and model export.
