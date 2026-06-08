@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
         default="none",
     )
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--distributed", action="store_true", help="Enable DistributedDataParallel (requires torch.distributed.launch)")
+    parser.add_argument("--local-rank", type=int, default=None, help="Local rank for DDP (set by launcher)")
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -69,6 +71,8 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         device=args.device,
         config=config,
+        distributed=args.distributed,
+        local_rank=args.local_rank,
     )
 
 

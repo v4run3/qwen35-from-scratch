@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 import math
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from qwen35.config import Qwen35Config
 from qwen35.model import Qwen35ForCausalLM
@@ -54,6 +58,7 @@ def evaluate(
     max_batches: int | None = None,
     amp_dtype: torch.dtype | None = None,
 ) -> tuple[float, float]:
+    is_distributed = dist.is_initialized()
     model.eval()
     losses: list[float] = []
     for batch_idx, (input_ids, labels) in enumerate(loader):
@@ -64,7 +69,12 @@ def evaluate(
         with autocast_context(device, amp_dtype):
             out = model(input_ids, labels=labels)
         assert out.loss is not None
-        losses.append(out.loss.item())
+        loss_val = out.loss.item()
+        if is_distributed:
+            loss_tensor = torch.tensor(loss_val, device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            loss_val = loss_tensor.item() / dist.get_world_size()
+        losses.append(loss_val)
 
     if not losses:
         raise ValueError("Evaluation loader produced no batches")
@@ -93,23 +103,49 @@ def train(
     gradient_checkpointing: bool = False,
     device: str | None = None,
     config: Qwen35Config | None = None,
+    distributed: bool = False,
+    local_rank: int | None = None,
 ) -> None:
+    if distributed:
+        if not dist.is_initialized():
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            local_rank = local_rank or int(os.environ.get("LOCAL_RANK", 0))
+            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+            is_main = rank == 0
+        else:
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            local_rank = local_rank or int(os.environ.get("LOCAL_RANK", 0))
+            device = f"cuda:{local_rank}"
+            is_main = rank == 0
+    else:
+        is_main = True
+        rank = 0
+        world_size = 1
+
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        output.mkdir(parents=True, exist_ok=True)
 
     text = load_text_corpus(data_path)
     tokenizer_path_out = output / "tokenizer.json"
 
     if tokenizer_path:
         tokenizer = BPETokenizer.load(tokenizer_path)
-        print(f"Loaded tokenizer from {tokenizer_path} (vocab_size={tokenizer.vocab_size})")
+        if is_main:
+            print(f"Loaded tokenizer from {tokenizer_path} (vocab_size={tokenizer.vocab_size})")
     else:
-        print(f"Training BPE tokenizer (target vocab_size={vocab_size})...")
+        if is_main:
+            print(f"Training BPE tokenizer (target vocab_size={vocab_size})...")
         tokenizer = BPETokenizer()
         tokenizer.train(text, vocab_size)
-        tokenizer.save(tokenizer_path_out)
-        print(f"Saved tokenizer to {tokenizer_path_out} (vocab_size={tokenizer.vocab_size})")
+        if is_main:
+            tokenizer.save(tokenizer_path_out)
+            print(f"Saved tokenizer to {tokenizer_path_out} (vocab_size={tokenizer.vocab_size})")
 
     if config is None:
         config = Qwen35Config(
@@ -128,12 +164,21 @@ def train(
     config.gradient_checkpointing = gradient_checkpointing
 
     dataset = TextLMDataset(text, tokenizer, block_size=block_size)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     eval_text = load_text_corpus(eval_data_path) if eval_data_path else text
     eval_dataset = TextLMDataset(eval_text, tokenizer, block_size=block_size)
-    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    if distributed:
+        train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, pin_memory=True, drop_last=True)
+        eval_loader = DataLoader(eval_dataset, batch_size=batch_size, sampler=eval_sampler, pin_memory=True, drop_last=False)
+    else:
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
     model = Qwen35ForCausalLM(config).to(device)
+    if distributed:
+        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.95))
     amp_dtype = resolve_amp_dtype(mixed_precision, device)
     scaler = torch.amp.GradScaler(
@@ -141,17 +186,21 @@ def train(
         enabled=amp_dtype == torch.float16 and torch.device(device).type == "cuda",
     )
 
-    print(f"Parameters: {model.num_parameters():,}")
-    print(f"Layer types: {config.layer_types}")
-    print(f"Mixed precision: {amp_dtype if amp_dtype is not None else 'off'}")
-    print(f"Gradient checkpointing: {config.gradient_checkpointing}")
-    print(f"Training on {len(dataset)} chunks, device={device}")
-    print(f"Evaluating on {len(eval_dataset)} chunks")
+    if is_main:
+        print(f"Parameters: {model.num_parameters():,}")
+        print(f"Layer types: {config.layer_types}")
+        print(f"Mixed precision: {amp_dtype if amp_dtype is not None else 'off'}")
+        print(f"Gradient checkpointing: {config.gradient_checkpointing}")
+        print(f"Distributed: {distributed} (rank={rank}/{world_size})")
+        print(f"Training on {len(dataset)} chunks, device={device}")
+        print(f"Evaluating on {len(eval_dataset)} chunks")
 
     step = 0
     model.train()
     while step < max_steps:
-        for input_ids, labels in loader:
+        if distributed and isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(step)
+        for input_ids, labels in train_loader:
             input_ids = input_ids.to(device)
             labels = labels.to(device)
 
@@ -175,7 +224,7 @@ def train(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-            if step % 10 == 0:
+            if is_main and step % 10 == 0:
                 print(f"step {step:5d} | loss {out.loss.item():.4f} | lr {lr:.2e}")
 
             if step > 0 and step % eval_interval == 0:
@@ -186,16 +235,19 @@ def train(
                     max_batches=eval_batches,
                     amp_dtype=amp_dtype,
                 )
-                print(
-                    f"eval step {step:5d} | loss {eval_loss:.4f} | ppl {eval_ppl:.2f}"
-                )
-                model.save_pretrained(str(output / f"checkpoint_step_{step}.pt"))
+                if is_main:
+                    print(
+                        f"eval step {step:5d} | loss {eval_loss:.4f} | ppl {eval_ppl:.2f}"
+                    )
+                    model_to_save = model.module if isinstance(model, DDP) else model
+                    model_to_save.save_pretrained(str(output / f"checkpoint_step_{step}.pt"))
 
             step += 1
             if step >= max_steps:
                 break
 
-    model.save_pretrained(str(output / "checkpoint_final.pt"))
+    model_to_save = model.module if isinstance(model, DDP) else model
+    model_to_save.save_pretrained(str(output / "checkpoint_final.pt"))
     eval_loss, eval_ppl = evaluate(
         model,
         eval_loader,
@@ -203,5 +255,9 @@ def train(
         max_batches=eval_batches,
         amp_dtype=amp_dtype,
     )
-    print(f"final eval | loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
-    print(f"Saved final checkpoint to {output / 'checkpoint_final.pt'}")
+    if is_main:
+        print(f"final eval | loss {eval_loss:.4f} | ppl {eval_ppl:.2f}")
+        print(f"Saved final checkpoint to {output / 'checkpoint_final.pt'}")
+
+    if distributed and dist.is_initialized():
+        dist.destroy_process_group()
