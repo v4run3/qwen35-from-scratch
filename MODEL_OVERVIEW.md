@@ -146,10 +146,6 @@ This means the model does not recompute everything from scratch for every new to
 - whether MoE is enabled
 - mixed precision and gradient checkpointing
 
-## Example hybrid block diagram
-
-![Transformer overview](https://upload.wikimedia.org/wikipedia/commons/thumb/8/8d/Transformer.svg/1200px-Transformer.svg.png)
-
 ## Summary
 
 This model is not a production-ready large language model yet. It is a research-style implementation of a hybrid transformer that mixes fast linear recurrence with periodic full softmax attention.
