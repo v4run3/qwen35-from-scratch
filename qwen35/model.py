@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -112,9 +115,51 @@ class Qwen35ForCausalLM(nn.Module):
             path,
         )
 
+    def save_pretrained_hf(self, directory: str) -> None:
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        config_path = directory / "config.json"
+        with open(config_path, "w", encoding="utf-8") as f:
+            import dataclasses
+            json.dump(dataclasses.asdict(self.config), f, indent=2)
+        weights_path = directory / "pytorch_model.bin"
+        torch.save(self.state_dict(), weights_path)
+        print(f"Saved HF-format checkpoint to {directory}")
+
     @classmethod
     def from_pretrained(cls, path: str, device: str = "cpu") -> Qwen35ForCausalLM:
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         model = cls(checkpoint["config"])
         model.load_state_dict(checkpoint["state_dict"])
+        return model.to(device)
+
+    @classmethod
+    def from_pretrained_hf(cls, directory: str, device: str = "cpu") -> Qwen35ForCausalLM:
+        directory = Path(directory)
+        config_path = directory / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"config.json not found in {directory}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            import dataclasses
+            config_dict = json.load(f)
+        config = Qwen35Config(**config_dict)
+
+        weights_path = directory / "pytorch_model.bin"
+        if not weights_path.exists():
+            weights_path = directory / "model.safetensors"
+            if not weights_path.exists():
+                raise FileNotFoundError(f"Neither pytorch_model.bin nor model.safetensors found in {directory}")
+
+        if str(weights_path).endswith(".safetensors"):
+            try:
+                from safetensors.torch import load_file
+                state_dict = load_file(str(weights_path), device=device)
+            except ImportError:
+                raise ImportError("safetensors package required to load .safetensors files. Install with: pip install safetensors")
+        else:
+            checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint)
+
+        model = cls(config)
+        model.load_state_dict(state_dict, strict=True)
         return model.to(device)
