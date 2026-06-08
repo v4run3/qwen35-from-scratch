@@ -1,1 +1,6 @@
 torch>=2.2.0
+
+# Optional: faster kernels
+# flash-attn>=2.0.0
+# fla>=0.1.0
+# safetensors>=0.4.0
